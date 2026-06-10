@@ -1,0 +1,408 @@
+import numpy as np
+from scipy.optimize import minimize
+from scipy.interpolate import make_interp_spline
+from scipy.interpolate import CubicSpline
+import pinocchio as pin
+import time
+import matplotlib.pyplot as plt
+
+# ==========================================
+# 1. BUILD EXACT UR5 MODEL IN PYTHON MEMORY
+# ==========================================
+def build_ur5_manually():
+    """
+    Bypasses broken URDF parsers by mathematically constructing 
+    the UR5 using exact masses, COM offsets, and kinematic placements.
+    """
+    model = pin.Model()
+    
+    # Exact UR5 Link Masses (kg)
+    masses = [3.7, 8.393, 2.275, 1.219, 1.219, 0.1879]
+    
+    # Exact UR5 Kinematics (SE3 Placements relative to previous joint)
+    placements = [
+        pin.SE3(np.eye(3), np.array([0.0, 0.0, 0.089159])),                           # Shoulder Pan
+        pin.SE3(pin.utils.rpyToMatrix(np.pi/2, 0, 0), np.array([0.0, 0.0, 0.0])),     # Shoulder Lift
+        pin.SE3(np.eye(3), np.array([-0.425, 0.0, 0.0])),                             # Elbow
+        pin.SE3(np.eye(3), np.array([-0.39225, 0.0, 0.0])),                           # Wrist 1
+        pin.SE3(pin.utils.rpyToMatrix(np.pi/2, 0, 0), np.array([0.0, 0.10915, 0.0])), # Wrist 2
+        pin.SE3(pin.utils.rpyToMatrix(-np.pi/2, 0, 0), np.array([0.0, 0.0, 0.09465])) # Wrist 3
+    ]
+    
+    # Accurate Center of Mass offsets relative to each joint frame
+    com_offsets = [
+        np.array([0.0, 0.0, 0.0]),             # Shoulder Pan
+        np.array([-0.2125, 0.0, 0.0]),         # Shoulder Lift (Upper Arm)
+        np.array([-0.196125, 0.0, 0.0]),       # Elbow (Forearm)
+        np.array([0.0, 0.0, 0.0]),             # Wrist 1
+        np.array([0.0, 0.0, 0.0]),             # Wrist 2
+        np.array([0.0, 0.0, 0.0])              # Wrist 3
+    ]
+    
+    parent_id = 0
+    for i in range(6):
+        # Add revolute joint around Z axis
+        joint_id = model.addJoint(parent_id, pin.JointModelRZ(), placements[i], f"joint_{i+1}")
+        
+        # Build the exact placement for the COM
+        com_placement = pin.SE3(np.eye(3), com_offsets[i])
+        
+        # Add inertial properties (Using approximated spherical inertia for solver speed)
+        inertia = pin.Inertia.FromSphere(masses[i], 0.05)
+        model.appendBodyToJoint(joint_id, inertia, com_placement)
+        
+        parent_id = joint_id
+        
+    # Create an operational frame for the spring attachment point (attached to Wrist 2)
+    # You can change parent_id to attach it to a different link
+    model.addFrame(pin.Frame("spring_attach", parent_id, 0, pin.SE3.Identity(), pin.FrameType.OP_FRAME))
+    
+    return model
+
+# Initialize the mathematical model globally
+model = build_ur5_manually()
+data = model.createData()
+frame_id = model.getFrameId("spring_attach")
+
+# ==========================================
+# 2. TASK PARAMETERS
+# ==========================================
+T_total = 1.0  # Total time for the point-to-point motion
+N_steps = 30   # Discrete integration steps (keep at 30-50 for faster NLP iterations)
+dt = T_total / N_steps
+
+# Start and End joint configurations (Radians)
+# q_start = np.array([0.0, -1.57, 0.0, -1.57, 0.0, 0.0])
+# q_end = np.array([1.57, -1.0, 1.0, -1.0, 1.57, 0.0])
+
+
+# Point 1 (Pick from Conveyor at Z=0): 
+# Base at 0 rad. Upper arm leaning forward, elbow bent deeply down, wrist pointing to floor.
+q_start = np.array([0.0, -1.0, 2.0, -2.57, -1.57, 0.0])
+
+# Point 2 (Place on Table at Z=0): 
+# Base rotated 90 deg (1.57 rad). Reaching slightly further out.
+q_end = np.array([1.57, -0.8, 1.8, -2.57, -1.57, 0.0])
+
+# ==========================================
+# 3. TRAJECTORY GENERATOR (CLAMPED)
+# ==========================================
+def generate_trajectory(control_points_interior):
+    """Generates continuous q, q_dot, q_ddot arrays with ZERO start/end velocity."""
+    t_eval = np.linspace(0, T_total, N_steps)
+    t_knots = np.linspace(0, T_total, 5) 
+    
+    q_traj = np.zeros((N_steps, 6))
+    v_traj = np.zeros((N_steps, 6))
+    a_traj = np.zeros((N_steps, 6))
+    
+    for j in range(6):
+        # 1. Combine fixed start, the 3 optimized interior points, and fixed end
+        cp = np.concatenate(([q_start[j]], control_points_interior[j], [q_end[j]]))
+        
+        # 2. Create the spline. 
+        # bc_type='clamped' forces the first derivative (velocity) to be ZERO at both ends!
+        spline = CubicSpline(t_knots, cp, bc_type='clamped')
+        
+        # 3. Evaluate the spline and its derivatives
+        q_traj[:, j] = spline(t_eval)
+        v_traj[:, j] = spline(t_eval, 1) # First derivative (Velocity)
+        a_traj[:, j] = spline(t_eval, 2) # Second derivative (Acceleration)
+        
+    return q_traj, v_traj, a_traj
+
+# ==========================================
+# 4. OBJECTIVE FUNCTION (CYCLIC ROUND TRIP)
+# ==========================================
+def objective_function(x):
+    k, L0 = x[0], x[1]
+    P_g = x[2:5]
+    P_r_local = x[5:8] 
+    cp_interior = x[8:].reshape(6, 3)
+    
+    # 1. Generate the forward path (Point 1 -> Point 2)
+    q_fwd, v_fwd, a_fwd = generate_trajectory(cp_interior)
+    
+    # 2. Mathematically mirror the path for the return trip (Point 2 -> Point 1)
+    q_ret = q_fwd[::-1]
+    v_ret = -v_fwd[::-1]  # Velocity reverses direction!
+    a_ret = a_fwd[::-1]   # Acceleration remains symmetric
+    
+    # 3. Concatenate into a full repetitive cycle
+    q_cycle = np.concatenate((q_fwd, q_ret), axis=0)
+    v_cycle = np.concatenate((v_fwd, v_ret), axis=0)
+    a_cycle = np.concatenate((a_fwd, a_ret), axis=0)
+    
+    total_energy = 0.0
+    
+    # Loop over the FULL cycle (2 * N_steps)
+    for i in range(2 * N_steps):
+        q, v, a = q_cycle[i], v_cycle[i], a_cycle[i]
+        
+        # Rigid body dynamics
+        tau_rigid = pin.rnea(model, data, q, v, a)
+        
+        # Kinematics for spring attachment point
+        pin.forwardKinematics(model, data, q)
+        pin.updateFramePlacements(model, data)
+        P_r_global = data.oMf[frame_id].act(P_r_local)
+        
+        # Calculate 3D Spring Force Vector
+        dist_vec = P_g - P_r_global
+        L = np.linalg.norm(dist_vec)
+        
+        F_spring_3D = np.zeros(3)
+        if L > L0: 
+            F_spring_3D = (k * (L - L0)) * (dist_vec / L)
+            
+        # Map Cartesian Force to Joint Torques via the Jacobian
+        J = pin.computeFrameJacobian(model, data, q, frame_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
+        tau_spring = J[:3, :].T @ F_spring_3D
+        
+        # Integrate squared net motor torque
+        tau_motor = tau_rigid - tau_spring
+        total_energy += np.sum(tau_motor**2) * dt
+        
+    # ----------------------------------------------------
+    # THE PENALTY BOX (Calculated only on forward path)
+    # ----------------------------------------------------
+    path_penalty = 0.0
+    velocity_penalty = 0.0
+    
+    for i in range(N_steps):
+        q_ideal = q_start + (q_end - q_start) * (i / (N_steps - 1))
+        path_penalty += np.sum((q_fwd[i] - q_ideal)**2) * 500.0 * dt
+        velocity_penalty += np.sum(v_fwd[i]**2) * 50.0 * dt
+
+    return total_energy + path_penalty + velocity_penalty
+
+# ==========================================
+# 5. EXECUTE OPTIMIZATION & EXTRACT DATA
+# ==========================================
+if __name__ == "__main__":
+    # Generate a linear initial guess for the interior spline points
+    cp_guess = np.linspace(q_start, q_end, 5)[1:-1].T.flatten()
+
+    x0 = np.concatenate((
+        [100.0, 0.5],             # k, L0
+        [0.5, 0.5, 1.0],          # Ground Anchor X, Y, Z 
+        [0.0, 0.0, 0.0],          # Robot Local Anchor
+        cp_guess                  # Spline control points 
+    ))
+
+    bounds = [
+        (0, 2000), (0.1, 2.0), 
+        (-2, 2), (-2, 2), (0, 3), 
+        (-0.1, 0.1), (-0.1, 0.1), (-0.1, 0.1) 
+    ]
+    # Tight bounds: allow +/- 1.0 radian deviation from standard path
+    for guess in cp_guess:
+        bounds.append((guess - 1.0, guess + 1.0))
+
+    # ---------------------------------------------------------
+    # RUN OPTIMIZER
+    # ---------------------------------------------------------
+    print("Running Baseline Evaluation (Rigid Arm, Standard Spline)...")
+    baseline_energy = objective_function(np.concatenate(([0.0, 0.0, 0,0,0, 0,0,0], cp_guess)))
+
+    print("Starting NLP Optimization (SLSQP)...")
+    import time
+    start_time = time.time()
+    
+    result = minimize(
+        objective_function, x0, method='SLSQP', bounds=bounds, options={'maxiter': 100, 'disp': True}
+    )
+
+    # ---------------------------------------------------------
+    # PRINT REQUESTED SETTINGS & PARAMETERS
+    # ---------------------------------------------------------
+    optimized_cp_interior = result.x[8:].reshape(6, 3)
+
+    print(f"\n--- OPTIMIZATION COMPLETE ({time.time() - start_time:.1f}s) ---")
+    print(f"Success Status: {result.success}")
+    
+    print("\n--- TASK SETTINGS ---")
+    print(f"Point 1 (Start Angles): {np.round(q_start, 3)}")
+    print(f"Point 2 (End Angles):   {np.round(q_end, 3)}")
+    
+    print("\n--- OPTIMIZED SPLINE PARAMETERS (Interior Knots) ---")
+    joint_names = ["Shoulder Pan", "Shoulder Lift", "Elbow", "Wrist 1", "Wrist 2", "Wrist 3"]
+    for j in range(6):
+        print(f"{joint_names[j]:<15}: {np.round(optimized_cp_interior[j], 3)}")
+
+    print("\n--- ENERGY COMPARISON ---")
+    print(f"Baseline (No Spring, Std Spline): {baseline_energy:.2f}")
+    print(f"Optimized (With Spring):          {result.fun:.2f}")
+    print(f"Energy Reduction:                 {((baseline_energy - result.fun)/baseline_energy)*100:.1f}%")
+    
+    print("\n--- OPTIMIZED HARDWARE ---")
+    print(f"Stiffness (k): {result.x[0]:.2f} N/m")
+    print(f"Rest Length (L0): {result.x[1]:.2f} m")
+
+    # ==========================================
+    # 6. CALCULATE ENERGIES FOR FULL CYCLE
+    # ==========================================
+    print("\nGenerating physics data for full cycle plots...")
+    
+    k_opt, L0_opt = result.x[0], result.x[1]
+    P_g_opt = result.x[2:5]
+    P_r_local_opt = result.x[5:8]
+    
+    q_fwd, v_fwd, a_fwd = generate_trajectory(optimized_cp_interior)
+    q_opt = np.concatenate((q_fwd, q_fwd[::-1]), axis=0)
+    v_opt = np.concatenate((v_fwd, -v_fwd[::-1]), axis=0)
+    
+    # Time array now spans 2x the total time
+    t_eval = np.linspace(0, 2 * T_total, 2 * N_steps)
+    
+    KE_arr = np.zeros(2 * N_steps)
+    PE_robot_arr = np.zeros(2 * N_steps)
+    PE_spring_arr = np.zeros(2 * N_steps)
+    
+    for i in range(2 * N_steps):
+        q, v = q_opt[i], v_opt[i]
+        
+        KE_arr[i] = pin.computeKineticEnergy(model, data, q, v)
+        PE_robot_arr[i] = pin.computePotentialEnergy(model, data, q)
+        
+        pin.forwardKinematics(model, data, q)
+        pin.updateFramePlacements(model, data)
+        P_r_global = data.oMf[frame_id].act(P_r_local_opt)
+        
+        L = np.linalg.norm(P_g_opt - P_r_global)
+        if L > L0_opt:
+            PE_spring_arr[i] = 0.5 * k_opt * (L - L0_opt)**2
+
+    # ==========================================
+    # 7. VISUALIZATION
+    # ==========================================
+    import matplotlib.pyplot as plt
+    
+    # --- FIGURE 1: CYCLIC TRAJECTORY (JOINT ANGLES VS TIME) ---
+    fig1 = plt.figure(figsize=(14, 8))
+    fig1.canvas.manager.set_window_title('Cyclic Trajectory Comparison')
+    plt.suptitle("Optimized Joint Trajectories (Full Back-and-Forth Cycle)", fontsize=16)
+    
+    # Generate the standard clamped spline for the forward trip, then mirror it for a baseline
+    q_std_fwd, _, _ = generate_trajectory(cp_guess.reshape(6,3))
+    q_std_cycle = np.concatenate((q_std_fwd, q_std_fwd[::-1]), axis=0)
+    
+    for j in range(6):
+        plt.subplot(2, 3, j+1)
+        
+        # Plot the Optimized Cyclic Path (Red)
+        plt.plot(t_eval, q_opt[:, j], label='Optimized (Spring)', color='red', linewidth=2)
+        
+        # Plot the Standard Cyclic Path (Blue Dashed)
+        plt.plot(t_eval, q_std_cycle[:, j], label='Baseline (No Spring)', linestyle='--', color='blue')
+        
+        # Add a vertical line marking the turnaround point
+        plt.axvline(x=T_total, color='black', linestyle=':', alpha=0.5, label='Turnaround' if j==0 else "")
+        
+        plt.title(joint_names[j])
+        plt.xlabel('Time (s)')
+        plt.ylabel('Angle (rad)')
+        plt.grid(True, linestyle=':', alpha=0.7)
+        if j == 0: 
+            plt.legend(loc='best')
+            
+    plt.tight_layout()
+    
+    # --- FIGURE 2: SYSTEM ENERGY DYNAMICS ---
+    fig2 = plt.figure(figsize=(12, 7))
+    fig2.canvas.manager.set_window_title('Energy Dynamics (Cyclic Task)')
+    plt.suptitle("System Energy over Full Back-and-Forth Cycle", fontsize=16)
+    
+    plt.plot(t_eval, KE_arr, label='Kinetic Energy (Robot)', color='orange', linewidth=2)
+    plt.plot(t_eval, PE_robot_arr - PE_robot_arr[0], label='Gravitational PE (Robot)', color='blue', linewidth=2)
+    plt.plot(t_eval, PE_spring_arr, label='Elastic PE (Spring)', color='green', linewidth=2)
+    
+    Total_E = KE_arr + (PE_robot_arr - PE_robot_arr[0]) + PE_spring_arr
+    plt.plot(t_eval, Total_E, label='Total Mechanical Energy', color='black', linestyle='--', linewidth=2)
+    
+    # Add a vertical line to show where the return trip starts
+    plt.axvline(x=T_total, color='red', linestyle=':', label='Turnaround Point')
+    
+    plt.xlabel('Time (s)')
+    plt.ylabel('Energy (Joules)')
+    plt.grid(True, linestyle=':', alpha=0.7)
+    plt.legend(loc='best')
+    plt.tight_layout()
+    
+    plt.show()
+
+    # ==========================================
+    # 8. 3D END-EFFECTOR ANIMATION (FIGURE 3)
+    # ==========================================
+    from matplotlib.animation import FuncAnimation
+    print("Generating 3D Animation...")
+
+    # 1. Pre-calculate the 3D position and rotation of the End Effector (Joint 6)
+    EE_pos = np.zeros((2 * N_steps, 3))
+    EE_rot = np.zeros((2 * N_steps, 3, 3))
+    joint_ee_id = 6  # Wrist 3 is the 6th joint in the model
+    
+    for i in range(2 * N_steps):
+        q = q_opt[i]
+        pin.forwardKinematics(model, data, q)
+        # Extract translation (Position) and rotation matrix (Orientation)
+        EE_pos[i] = data.oMi[joint_ee_id].translation
+        EE_rot[i] = data.oMi[joint_ee_id].rotation
+
+    # 2. Setup the 3D Figure
+    fig3 = plt.figure(figsize=(10, 8))
+    fig3.canvas.manager.set_window_title('End Effector Animation')
+    ax3 = fig3.add_subplot(111, projection='3d')
+    
+    # Draw the static path trace
+    ax3.plot(EE_pos[:, 0], EE_pos[:, 1], EE_pos[:, 2], color='black', linestyle=':', alpha=0.5)
+
+    # Create empty line objects for the 3 moving axes (The Triad)
+    axis_len = 0.15 # Length of the coordinate frame lines in meters
+    x_line, = ax3.plot([], [], [], color='red', linewidth=3, label='X (Tool Forward)')
+    y_line, = ax3.plot([], [], [], color='green', linewidth=3, label='Y (Tool Left)')
+    z_line, = ax3.plot([], [], [], color='blue', linewidth=3, label='Z (Tool Up)')
+
+    # 3. Animation Functions
+    def init():
+        # Set 3D axis limits based on the trajectory bounds
+        pad = 0.3
+        ax3.set_xlim([np.min(EE_pos[:, 0]) - pad, np.max(EE_pos[:, 0]) + pad])
+        ax3.set_ylim([np.min(EE_pos[:, 1]) - pad, np.max(EE_pos[:, 1]) + pad])
+        ax3.set_zlim([np.min(EE_pos[:, 2]) - pad, np.max(EE_pos[:, 2]) + pad])
+        ax3.set_xlabel('Global X (m)')
+        ax3.set_ylabel('Global Y (m)')
+        ax3.set_zlabel('Global Z (m)')
+        ax3.set_title('End Effector Pose (Pick & Place Cycle)')
+        ax3.legend()
+        return x_line, y_line, z_line
+
+    def update(frame):
+        p = EE_pos[frame]
+        R = EE_rot[frame]
+
+        # Calculate the end points of the triad lines based on current rotation
+        px = p + R @ np.array([axis_len, 0, 0])
+        py = p + R @ np.array([0, axis_len, 0])
+        pz = p + R @ np.array([0, 0, axis_len])
+
+        # Update X-axis (Red)
+        x_line.set_data([p[0], px[0]], [p[1], px[1]])
+        x_line.set_3d_properties([p[2], px[2]])
+
+        # Update Y-axis (Green)
+        y_line.set_data([p[0], py[0]], [p[1], py[1]])
+        y_line.set_3d_properties([p[2], py[2]])
+
+        # Update Z-axis (Blue)
+        z_line.set_data([p[0], pz[0]], [p[1], pz[1]])
+        z_line.set_3d_properties([p[2], pz[2]])
+
+        return x_line, y_line, z_line
+
+    # 4. Execute the animation (Must be assigned to a variable like 'ani'!)
+    # interval is in milliseconds. dt * 1000 makes it play in real-time.
+    ani = FuncAnimation(fig3, update, frames=2 * N_steps, init_func=init, blit=False, interval=dt * 1000)
+    
+    # Finally, show all figures
+    plt.show()    
