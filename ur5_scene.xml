@@ -1,0 +1,14 @@
+<mujoco model="ur5_simulation">
+  <compiler strippath="false"/>
+
+  <include file="ur5.urdf"/>
+
+  <actuator>
+    <position name="servo_shoulder_pan"  joint="shoulder_pan_joint"  kp="500" kv="10"/>
+    <position name="servo_shoulder_lift" joint="shoulder_lift_joint" kp="500" kv="10"/>
+    <position name="servo_elbow"         joint="elbow_joint"         kp="500" kv="10"/>
+    <position name="servo_wrist_1"       joint="wrist_1_joint"       kp="500" kv="10"/>
+    <position name="servo_wrist_2"       joint="wrist_2_joint"       kp="500" kv="10"/>
+    <position name="servo_wrist_3"       joint="wrist_3_joint"       kp="500" kv="10"/>
+  </actuator>
+</mujoco>
