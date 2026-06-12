@@ -3,14 +3,27 @@ from scipy.optimize import minimize
 from scipy.interpolate import CubicSpline
 import pinocchio as pin
 import time
+import platform
+import matplotlib
+
+# Check if the operating system is macOS ('Darwin') or Linux
+IS_MACOS = platform.system() == 'Darwin'
+
+# If on macOS, force the non-interactive backend to prevent thread crashes
+if IS_MACOS:
+    matplotlib.use('Agg')
+
+
 import matplotlib.pyplot as plt
+
 
 # ==========================================
 # 1. BUILD EXACT UR5 MODEL IN PYTHON MEMORY
 # ==========================================
 
 # Initialize the mathematical model globally
-urdf_path = "/home/wong/ws_robot_energy/ur5.urdf"
+# urdf_path = "/home/wong/ws_robot_energy/ur5.urdf"
+urdf_path = "ur5.urdf"
 model = pin.buildModelFromUrdf(urdf_path)
 data = model.createData()
 
